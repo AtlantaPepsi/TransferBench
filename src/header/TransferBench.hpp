@@ -108,11 +108,13 @@ namespace TransferBench
     EXE_NIC          = 3,                       ///<  NIC RDMA executor         (subExecutor = queue pair)
     EXE_NIC_NEAREST  = 4,                       ///<  NIC RDMA nearest executor (subExecutor = queue pair)
     EXE_GPU_BDMA     = 5,                       ///<  GPU Batched SDMA executor (subExecutor = batch item)
+    EXE_GPU_SDMA_XIO = 6,                       ///<  GPU-initiated SDMA executor via rocm-xio (subExecutor = not supported)
   };
-  char const ExeTypeStr[7] = "CGDINB";
+  char const ExeTypeStr[8] = "CGDINBX";
   inline bool IsCpuExeType(ExeType e){ return e == EXE_CPU; }
-  inline bool IsGpuExeType(ExeType e){ return e == EXE_GPU_GFX || e == EXE_GPU_DMA || e == EXE_GPU_BDMA; }
+  inline bool IsGpuExeType(ExeType e){ return e == EXE_GPU_GFX || e == EXE_GPU_DMA || e == EXE_GPU_BDMA || e == EXE_GPU_SDMA_XIO; }
   inline bool IsNicExeType(ExeType e){ return e == EXE_NIC || e == EXE_NIC_NEAREST; }
+  inline bool IsSdmaXioExeType(ExeType e){ return e == EXE_GPU_SDMA_XIO; }
 
   /**
    * A ExeDevice defines a specific Executor
@@ -274,6 +276,15 @@ namespace TransferBench
     int         useNuma         = 0;            ///< Switch to closest numa thread for execution
   };
 
+  /**
+   * SDMA-XIO Executor options (GPU-initiated SDMA via rocm-xio)
+   *
+   * @note Empty placeholder for v1. Future fields will live here (e.g. completion mode,
+   *       per-queue ring sizing, HIP-event timing toggle).
+   */
+  struct SdmaXioOptions
+  {
+  };
 
   /**
    * Configuration options for performing Transfers
@@ -286,6 +297,7 @@ namespace TransferBench
     GfxOptions     gfx;                         ///< GFX executor options
     DmaOptions     dma;                         ///< DMA executor options
     NicOptions     nic;                         ///< NIC executor options
+    SdmaXioOptions sdmaXio;                     ///< SDMA-XIO executor options
   };
 
   /**
@@ -2482,6 +2494,47 @@ namespace {
         hasFatalError = true;
         break;
 #endif
+      case EXE_GPU_SDMA_XIO:
+        // TODO(sdma-xio): Empty src/dst allowed later for SDMA. For v1, require exactly 1 src + 1 dst.
+        if (t.srcs.size() != 1 || t.dsts.size() != 1) {
+          errors.push_back({ERR_FATAL,
+                            "Transfer %d: SDMA-XIO executor must have exactly 1 source and 1 destination", i});
+          hasFatalError = true;
+          break;
+        }
+
+        if (t.exeDevice.exeIndex < 0 || t.exeDevice.exeIndex >= numExecutors) {
+          errors.push_back({ERR_FATAL,
+                            "Transfer %d: SDMA-XIO index must be between 0 and %d (instead of %d) for rank %d",
+                            i, numExecutors - 1, t.exeDevice.exeIndex, t.exeDevice.exeRank});
+          hasFatalError = true;
+          break;
+        }
+
+        if (t.exeSubIndex != -1) {
+          errors.push_back({ERR_FATAL,
+              "Transfer %d: SDMA-XIO executor does not support executor subindices (engine selection is implicit via xio createConnection)", i});
+          hasFatalError = true;
+          break;
+        }
+
+        // TODO(sdma-xio): SDMA-XIO should allow non GPU mem later. For v1, both endpoints must be GPU memory.
+        if (!IsGpuMemType(t.srcs[0].memType) || !IsGpuMemType(t.dsts[0].memType)) {
+          errors.push_back({ERR_FATAL,
+              "Transfer %d: SDMA-XIO requires both src and dst to be GPU memory (v1)", i});
+          hasFatalError = true;
+          break;
+        }
+
+        // TODO(sdma-xio): SDMA-XIO inter pod to be checked later. For v1, all participants must be on the executor rank.
+        if (t.srcs[0].memRank != t.exeDevice.exeRank || t.dsts[0].memRank != t.exeDevice.exeRank) {
+          errors.push_back({ERR_FATAL,
+              "Transfer %d: SDMA-XIO is intra-rank only (src rank=%d, dst rank=%d, exe rank=%d)",
+              i, t.srcs[0].memRank, t.dsts[0].memRank, t.exeDevice.exeRank});
+          hasFatalError = true;
+          break;
+        }
+        break;
       case EXE_NIC: case EXE_NIC_NEAREST:
 #ifdef NIC_EXEC_ENABLED
       {
@@ -2667,6 +2720,15 @@ namespace {
         }
         break;
       }
+      case EXE_GPU_SDMA_XIO:
+      {
+        if (transferCount[exeDevice] > gpuMaxHwQueues) {
+          errors.push_back({ERR_WARN,
+                           "SDMA-XIO %d attempting %d parallel transfers, however GPU_MAX_HW_QUEUES only set to %d",
+                           exeDevice.exeIndex, transferCount[exeDevice], gpuMaxHwQueues});
+        }
+        break;
+      }
       default:
         break;
       }
@@ -2764,6 +2826,10 @@ namespace {
     vector<void*>              batchSrcs;         ///< Source pointers (per batch item)
     vector<size_t>             batchBytes;        ///< Bytes to copy (per batch item)
 #endif
+
+    // For SDMA-XIO executor (populated by PrepareSdmaXioTransferResources in follow-up)
+    // No fields yet -- rocm-xio handles (SdmaQueueInfo / SdmaConnectionInfo / signal counter)
+    // will be added together with the real Prepare/Run/Teardown implementations.
 
     // Counters
     double                     totalDurationMsec; ///< Total duration for all iterations for this Transfer
@@ -3721,6 +3787,27 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
   }
 #endif // NIC_EXEC_ENABLED
 
+// SDMA-XIO Executor-related functions
+//========================================================================================
+
+  // TODO(sdma-xio): Initialize rocm-xio sdma endpoint (initEndpoint once, createConnection,
+  // createQueue, allocate signal counter on src GPU). Mirrors sdma_test_xio.cpp steps 1-6.
+  static ErrResult PrepareSdmaXioTransferResources(ConfigOptions    const& cfg,
+                                                   ExeDevice        const& exeDevice,
+                                                   Transfer         const& t,
+                                                   TransferResources&      rss)
+  {
+    return ERR_NONE;
+  }
+
+  // TODO(sdma-xio): Release rocm-xio handles (destroyQueue, free signal counter). Endpoint
+  // shutdown is deferred to process exit per sdma-ep.h idempotence guidance.
+  static ErrResult TeardownSdmaXioTransferResources(TransferResources& rss,
+                                                    Transfer    const& t)
+  {
+    return ERR_NONE;
+  }
+
 // Data validation-related functions
 //========================================================================================
 
@@ -4288,12 +4375,14 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
     }
 
     // Prepare additional requirements for GPU-based executors
-    if ((exeDevice.exeType == EXE_GPU_GFX || exeDevice.exeType == EXE_GPU_DMA || exeDevice.exeType == EXE_GPU_BDMA)
+    if ((exeDevice.exeType == EXE_GPU_GFX || exeDevice.exeType == EXE_GPU_DMA || exeDevice.exeType == EXE_GPU_BDMA
+         || exeDevice.exeType == EXE_GPU_SDMA_XIO)
         && exeDevice.exeRank == localRank) {
       ERR_CHECK(hipSetDevice(exeDevice.exeIndex));
 
       // Determine how many streams to use
       int const numStreamsToUse = (exeDevice.exeType == EXE_GPU_DMA || exeDevice.exeType == EXE_GPU_BDMA ||
+                                   exeDevice.exeType == EXE_GPU_SDMA_XIO ||
                                   (exeDevice.exeType == EXE_GPU_GFX && cfg.gfx.useMultiStream))
                                   ? exeInfo.resources.size() : 1;
       exeInfo.streams.resize(numStreamsToUse);
@@ -4416,6 +4505,14 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
 #endif
     }
 
+    // Prepare for SDMA-XIO executor
+    if (IsSdmaXioExeType(exeDevice.exeType) && exeDevice.exeRank == localRank) {
+      for (auto& rss : exeInfo.resources) {
+        Transfer const& t = transfers[rss.transferIdx];
+        ERR_CHECK(PrepareSdmaXioTransferResources(cfg, exeDevice, t, rss));
+      }
+    }
+
     // Check that GPU wallclock rate is non-zero
     if (exeDevice.exeType == EXE_GPU_GFX && exeInfo.wallClockRate == 0 && exeDevice.exeRank == localRank) {
       if (getenv("TB_WALLCLOCK_RATE")) {
@@ -4515,10 +4612,16 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
         ERR_CHECK(TeardownNicTransferResources(rss, t));
       }
 #endif
+
+      // Destroy SDMA-XIO related resources
+      if (IsSdmaXioExeType(exeDevice.exeType) && exeDevice.exeRank == localRank) {
+        ERR_CHECK(TeardownSdmaXioTransferResources(rss, t));
+      }
     }
 
     // Teardown additional requirements for GPU-based executors
-    if ((exeDevice.exeType == EXE_GPU_GFX || exeDevice.exeType == EXE_GPU_DMA || exeDevice.exeType == EXE_GPU_BDMA)
+    if ((exeDevice.exeType == EXE_GPU_GFX || exeDevice.exeType == EXE_GPU_DMA || exeDevice.exeType == EXE_GPU_BDMA
+         || exeDevice.exeType == EXE_GPU_SDMA_XIO)
         && exeDevice.exeRank == localRank) {
       for (auto stream : exeInfo.streams)
         ERR_CHECK(hipStreamDestroy(stream));
@@ -5651,6 +5754,20 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
   }
 #endif // BMA_EXEC_ENABLED
 
+// SDMA-XIO Executor run-related functions
+//========================================================================================
+
+  // TODO(sdma-xio): Launch a single-thread kernel per Transfer that calls
+  // xio::sdma_ep::putSignal + waitSignal, then hipStreamSynchronize. Mirrors
+  // RunDmaExecutor's std::async-per-stream layout once parity work begins.
+  static ErrResult RunSdmaXioExecutor(int           const  iteration,
+                                      ConfigOptions const& cfg,
+                                      int           const  exeIndex,
+                                      ExeInfo&             exeInfo)
+  {
+    return ERR_NONE;
+  }
+
 // Executor-related functions
 //========================================================================================
   static ErrResult RunExecutor(int           const  iteration,
@@ -5668,6 +5785,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
 #ifdef BMA_EXEC_ENABLED
     case EXE_GPU_BDMA: return RunBmaExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
 #endif
+    case EXE_GPU_SDMA_XIO:  return RunSdmaXioExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
     default:            return {ERR_FATAL, "Unsupported executor (%d)", exeDevice.exeType};
     }
   }
@@ -6361,7 +6479,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
         result |= RecursiveWildcardTransferExpansion(wc, baseRankIndex, numBytes, numSubExecs, transfers);
         wc.exe.exeSubIndices[0] = -2;
         return result;
-      case EXE_GPU_GFX: case EXE_GPU_DMA: case EXE_GPU_BDMA:
+      case EXE_GPU_GFX: case EXE_GPU_DMA: case EXE_GPU_BDMA: case EXE_GPU_SDMA_XIO:
       {
         // Iterate over all available subindices
         ExeDevice exeDevice = {wc.exe.exeType, wc.exe.exeIndices[0], wc.exe.exeRanks[0], 0};
@@ -7248,6 +7366,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
     topo.numExecutors[EXE_GPU_GFX] = numGpus;
     topo.numExecutors[EXE_GPU_DMA] = numGpus;
     topo.numExecutors[EXE_GPU_BDMA] = numGpus;
+    topo.numExecutors[EXE_GPU_SDMA_XIO] = numGpus;
 
     std::vector<std::string> gpuArchNames(numGpus);
 
@@ -7271,6 +7390,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       topo.executorName[{EXE_GPU_GFX, exeIndex}] = gpuName;
       topo.executorName[{EXE_GPU_DMA, exeIndex}] = gpuName;
       topo.executorName[{EXE_GPU_BDMA, exeIndex}] = gpuName;
+      topo.executorName[{EXE_GPU_SDMA_XIO, exeIndex}] = gpuName;
 
 #if !defined(__NVCC__)
       hsa_agent_t gpuAgent = gpuAgents[exeIndex];
@@ -7300,9 +7420,12 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       topo.numExecutorSubIndices[{EXE_GPU_GFX, exeIndex}] = numXccs;
       topo.numExecutorSubIndices[{EXE_GPU_DMA, exeIndex}] = numDmaEngines;
       topo.numExecutorSubIndices[{EXE_GPU_BDMA, exeIndex}] = 0;
+      // TODO(sdma-xio): expose xio engine index as subIndex once createConnection's engineId is plumbed through
+      topo.numExecutorSubIndices[{EXE_GPU_SDMA_XIO, exeIndex}] = 0;
       topo.numSubExecutors[{EXE_GPU_GFX, exeIndex}] = numDeviceCUs;
       topo.numSubExecutors[{EXE_GPU_DMA, exeIndex}] = 1;
       topo.numSubExecutors[{EXE_GPU_BDMA, exeIndex}] = numDmaEngines;
+      topo.numSubExecutors[{EXE_GPU_SDMA_XIO, exeIndex}] = 1;
       topo.closestCpuNumaToGpu[exeIndex] = closestNuma;
       topo.closestNicsToGpu[exeIndex] = {};
 
@@ -7722,7 +7845,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
         return {ERR_FATAL, "CPU index must be between 0 and %d inclusively", numCpus - 1};
       agent = cpuAgents[exeDevice.exeIndex];
       break;
-    case EXE_GPU_GFX: case EXE_GPU_DMA: case EXE_GPU_BDMA:
+    case EXE_GPU_GFX: case EXE_GPU_DMA: case EXE_GPU_BDMA: case EXE_GPU_SDMA_XIO:
       if (exeIndex < 0 || exeIndex >= numGpus)
         return {ERR_FATAL, "GPU index must be between 0 and %d inclusively", numGpus - 1};
       agent = gpuAgents[exeIndex];
