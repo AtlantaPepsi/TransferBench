@@ -26,6 +26,8 @@ THE SOFTWARE.
 #include <arpa/inet.h>
 #include <atomic>
 #include <barrier>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <ifaddrs.h>
@@ -77,6 +79,32 @@ THE SOFTWARE.
 #include "hsa/hsa_ext_amd.h"
 #ifdef AMD_SMI_ENABLED
 #include "amd_smi/amdsmi.h"
+#endif
+
+// SDMA-XIO executor glue. Enabled when the Makefile detected librocm-xio.so at
+// build time (-DROCM_XIO_AVAILABLE). librocm-xio is linked dynamically; no
+// dlopen scaffolding is needed.
+//
+// Vendored sdma-ep.h supplies the device-side templates that must be inlined
+// into SdmaXioKernel (putSignal, waitSignal, SdmaQueueHandle methods) plus the
+// host function declarations (initEndpoint, createConnection, createQueue,
+// destroyQueue, shutdownEndpoint) that the dynamic linker resolves against
+// librocm-xio.so. We mirror xio.h's XIO_DEVICE_MEM_* macros and the two
+// allocator declarations we need rather than vendoring all of xio.h, which
+// pulls in five other rocm-xio headers we don't use.
+#if defined(ROCM_XIO_AVAILABLE)
+#define XIO_DEVICE_MEM_FINE_GRAINED   0x0
+#define XIO_DEVICE_MEM_COARSE_GRAINED 0x1
+#define XIO_DEVICE_MEM_UNCACHED       0x2
+#define XIO_DEVICE_MEM_VMEM           0x4
+#define XIO_DEVICE_MEM_HIP            0x8
+#include "vendor/sdma-ep.h"
+namespace xio {
+  hsa_status_t allocDeviceMemory(size_t size, void** ptr, const char* label,
+                                 unsigned flags = XIO_DEVICE_MEM_FINE_GRAINED,
+                                 int gpuId = 0);
+  void         freeDeviceMemory(void* ptr, unsigned flags);
+}
 #endif
 #endif
 /// @endcond
@@ -2518,12 +2546,23 @@ namespace {
           break;
         }
 
-        // TODO(sdma-xio): SDMA-XIO should allow non GPU mem later. For v1, both endpoints must be GPU memory.
+        // TODO(sdma-xio): SDMA-XIO should allow non GPU mem later (pinned host paths).
+        // For v1, both src and dst must be GPU memory so xio createQueue(srcGpu, dstGpu, ...)
+        // has well-defined endpoints on both sides.
         if (!IsGpuMemType(t.srcs[0].memType) || !IsGpuMemType(t.dsts[0].memType)) {
           errors.push_back({ERR_FATAL,
               "Transfer %d: SDMA-XIO requires both src and dst to be GPU memory (v1)", i});
           hasFatalError = true;
           break;
+        }
+
+        // Warn-and-reroute. Unlike DMA where HIP/HSA transparently routes to the source
+        // agent's SDMA engine, rocm-xio's createQueue is keyed on the source GPU - we do
+        // the reroute ourselves at prepare time (inline effExeIndex from t.srcs[0].memIndex).
+        if (t.srcs[0].memIndex != t.exeDevice.exeIndex) {
+          errors.push_back({ERR_WARN,
+              "Transfer %d: SDMA-XIO executor may automatically switch to using the source memory device (%d) not (%d)",
+              i, t.srcs[0].memIndex, t.exeDevice.exeIndex});
         }
 
         // TODO(sdma-xio): SDMA-XIO inter pod to be checked later. For v1, all participants must be on the executor rank.
@@ -2827,9 +2866,12 @@ namespace {
     vector<size_t>             batchBytes;        ///< Bytes to copy (per batch item)
 #endif
 
-    // For SDMA-XIO executor (populated by PrepareSdmaXioTransferResources in follow-up)
-    // No fields yet -- rocm-xio handles (SdmaQueueInfo / SdmaConnectionInfo / signal counter)
-    // will be added together with the real Prepare/Run/Teardown implementations.
+    // For SDMA-XIO executor
+#if defined(ROCM_XIO_AVAILABLE)
+    xio::sdma_ep::SdmaQueueInfo       xioQueueInfo  = {};  ///< xio queue handle + srcDeviceId/dstDeviceId
+    xio::sdma_ep::SdmaConnectionInfo  xioConn       = {};  ///< xio connection metadata
+    uint64_t*                         xioSignal     = nullptr;  ///< 8 bytes, uncached, on xioQueueInfo.srcDeviceId
+#endif
 
     // Counters
     double                     totalDurationMsec; ///< Total duration for all iterations for this Transfer
@@ -3790,23 +3832,206 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
 // SDMA-XIO Executor-related functions
 //========================================================================================
 
-  // TODO(sdma-xio): Initialize rocm-xio sdma endpoint (initEndpoint once, createConnection,
-  // createQueue, allocate signal counter on src GPU). Mirrors sdma_test_xio.cpp steps 1-6.
+#if defined(ROCM_XIO_AVAILABLE)
+  // Per-transfer in-kernel cycle slot. Written by SdmaXioKernel via wall_clock64(),
+  // read back by ExecuteSdmaXioTransfer to compute per-transfer durationMsec. Lives
+  // in a transient pinned-host array owned by RunSdmaXioExecutor (no persistent
+  // field on TransferResources or ExeInfo).
+  struct SdmaXioCycles {
+    int64_t startCycle;
+    int64_t stopCycle;
+  };
+
+  // Source-priority reroute: queue ring + signal live on the GPU holding source memory.
+  // v1 validation guarantees src is GPU memory; the else-branch is documentation for
+  // the deferred host-source path. Mirrors the DMA warn-and-reroute precedent at
+  // TransferBench.hpp L2424-L2441, but the reroute itself happens here at prepare
+  // time because rocm-xio's createQueue bakes the source GPU into the ring buffer,
+  // doorbell, engine binding, and signal page.
+  static inline int SdmaXioEffExeIndex(Transfer const& t) {
+    return IsGpuMemType(t.srcs[0].memType) ? t.srcs[0].memIndex : t.dsts[0].memIndex;
+  }
+
+  // #region agent log
+  // Debug-mode instrumentation (session 1183aa). NDJSON sink; safe if file path missing.
+  static inline void XioDbgLog_(const char* loc, const char* msg, const std::string& kv) {
+    FILE* f = std::fopen("/home/timhu102/5-8/.cursor/debug-1183aa.log", "a");
+    if (!f) return;
+    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    std::fprintf(f,
+      "{\"sessionId\":\"1183aa\",\"runId\":\"sdma-xio-prepare\",\"hypothesisId\":\"H1-H5\","
+      "\"location\":\"%s\",\"message\":\"%s\",\"timestamp\":%lld,\"data\":{%s}}\n",
+      loc, msg, (long long)now, kv.c_str());
+    std::fclose(f);
+  }
+  // #endregion
+
   static ErrResult PrepareSdmaXioTransferResources(ConfigOptions    const& cfg,
                                                    ExeDevice        const& exeDevice,
                                                    Transfer         const& t,
                                                    TransferResources&      rss)
   {
+    // #region agent log
+    {
+      char buf[512];
+      std::snprintf(buf, sizeof(buf),
+        "\"transferIdx\":%d,\"exeType\":%d,\"exeIndex\":%d,\"exeRank\":%d,"
+        "\"srcs\":%zu,\"src0_memType\":%d,\"src0_memIndex\":%d,\"src0_memRank\":%d,"
+        "\"dsts\":%zu,\"dst0_memType\":%d,\"dst0_memIndex\":%d,\"dst0_memRank\":%d,"
+        "\"numBytes\":%zu",
+        rss.transferIdx, (int)exeDevice.exeType, exeDevice.exeIndex, exeDevice.exeRank,
+        t.srcs.size(), t.srcs.empty()?-1:(int)t.srcs[0].memType, t.srcs.empty()?-1:t.srcs[0].memIndex,
+        t.srcs.empty()?-1:t.srcs[0].memRank,
+        t.dsts.size(), t.dsts.empty()?-1:(int)t.dsts[0].memType, t.dsts.empty()?-1:t.dsts[0].memIndex,
+        t.dsts.empty()?-1:t.dsts[0].memRank,
+        t.numBytes);
+      XioDbgLog_("TransferBench.hpp:PrepareSdmaXioTransferResources:entry",
+                 "prepare entered", std::string(buf));
+    }
+    // #endregion
+
+    static std::once_flag s_xioInit;
+    bool initFailed = false;
+    std::call_once(s_xioInit, [&]{
+      if (xio::sdma_ep::initEndpoint() != 0) initFailed = true;
+    });
+
+    // #region agent log
+    {
+      char buf[128];
+      std::snprintf(buf, sizeof(buf), "\"initFailed\":%s", initFailed?"true":"false");
+      XioDbgLog_("TransferBench.hpp:PrepareSdmaXioTransferResources:postInit",
+                 "after initEndpoint", std::string(buf));
+    }
+    // #endregion
+
+    if (initFailed) return {ERR_FATAL,
+        "xio::sdma_ep::initEndpoint failed (is rocm-xio wired in?)"};
+
+    int const effExeIndex = SdmaXioEffExeIndex(t);  // == t.srcs[0].memIndex in v1
+    int const dstGpu      = t.dsts[0].memIndex;     // v1 guarantees dst is GPU memory
+
+    // #region agent log
+    {
+      char buf[256];
+      std::snprintf(buf, sizeof(buf),
+        "\"effExeIndex\":%d,\"dstGpu\":%d,\"src0_is_gpu_mem\":%s",
+        effExeIndex, dstGpu,
+        (!t.srcs.empty() && IsGpuMemType(t.srcs[0].memType)) ? "true" : "false");
+      XioDbgLog_("TransferBench.hpp:PrepareSdmaXioTransferResources:routing",
+                 "effExeIndex resolved (H4)", std::string(buf));
+    }
+    // #endregion
+
+    int connRc = xio::sdma_ep::createConnection(effExeIndex, dstGpu, &rss.xioConn);
+
+    // #region agent log
+    {
+      char buf[256];
+      std::snprintf(buf, sizeof(buf),
+        "\"createConnection_rc\":%d,\"engineId\":%u,\"xioConn_src\":%d,\"xioConn_dst\":%d",
+        connRc, (unsigned)rss.xioConn.engineId, rss.xioConn.srcDeviceId, rss.xioConn.dstDeviceId);
+      XioDbgLog_("TransferBench.hpp:PrepareSdmaXioTransferResources:postCreateConn",
+                 "after createConnection (H1,H4)", std::string(buf));
+    }
+    // #endregion
+
+    if (connRc != 0)
+      return {ERR_FATAL, "Transfer %d: xio createConnection(%d -> %d) failed",
+              rss.transferIdx, effExeIndex, dstGpu};
+
+    // rocm-xio's createConnection() can return success while leaving engineId == (uint32_t)-1
+    // when getSdmaEngineId() finds no XGMI-link recommendation and the legacy OAM fallback
+    // is unavailable (sysfs xgmi_physical_id missing -> getOamId throws -> fallback set to
+    // -1 -> KFD RecSdmaEngIdMask=0x0 -> returns -1). Passing this to createQueue() makes
+    // anvil.hip's CHECK_HSAKMT_SUCCESS macro call exit(EXIT_FAILURE), killing the whole
+    // process. Catch it here and surface a real error instead.
+    if (rss.xioConn.engineId == static_cast<uint32_t>(-1)) {
+      // #region agent log
+      {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+          "\"effExeIndex\":%d,\"dstGpu\":%d,\"engineId\":4294967295",
+          effExeIndex, dstGpu);
+        XioDbgLog_("TransferBench.hpp:PrepareSdmaXioTransferResources:engineInvalid",
+                   "engineId is (uint32_t)-1; aborting before createQueue (post-fix)",
+                   std::string(buf));
+      }
+      // #endregion
+      return {ERR_FATAL,
+        "Transfer %d: rocm-xio could not select an SDMA engine for GPU %d -> %d "
+        "(engineId=-1). Cross-GPU SDMA-XIO requires the GPU pair to share an XGMI "
+        "fabric link with a recommended SDMA engine mask reported by KFD. On this "
+        "host /sys/bus/pci/devices/<bdf>/xgmi_physical_id is empty and KFD reports "
+        "RecSdmaEngIdMask=0x0 for the link, so SDMA-XIO is not applicable. Try a "
+        "same-GPU transfer (e.g. G0->X0->G0) or run on hardware with XGMI peers.",
+        rss.transferIdx, effExeIndex, dstGpu};
+    }
+
+    // #region agent log
+    XioDbgLog_("TransferBench.hpp:PrepareSdmaXioTransferResources:preCreateQueue",
+               "about to call createQueue (rocm-xio will print SDMA_DEBUG if env set)",
+               "\"phase\":\"pre-createQueue\"");
+    // #endregion
+
+    int queueRc = xio::sdma_ep::createQueue(effExeIndex, dstGpu, &rss.xioQueueInfo);
+
+    // #region agent log
+    // Note: anvil.hip CHECK_HSAKMT_SUCCESS exit(EXIT_FAILURE)s on KFD error, so this
+    // line is only reached on success. Its absence in the log => createQueue exit()ed.
+    {
+      char buf[128];
+      std::snprintf(buf, sizeof(buf), "\"createQueue_rc\":%d", queueRc);
+      XioDbgLog_("TransferBench.hpp:PrepareSdmaXioTransferResources:postCreateQueue",
+                 "after createQueue (only reached on success)", std::string(buf));
+    }
+    // #endregion
+
+    if (queueRc != 0)
+      return {ERR_FATAL, "Transfer %d: xio createQueue(%d -> %d) failed",
+              rss.transferIdx, effExeIndex, dstGpu};
+
+    ERR_CHECK(hipSetDevice(effExeIndex));
+    hsa_status_t allocStatus =
+        xio::allocDeviceMemory(sizeof(uint64_t), (void**)&rss.xioSignal,
+                               "sdma-xio-signal", XIO_DEVICE_MEM_UNCACHED);
+    if (allocStatus != HSA_STATUS_SUCCESS)
+      return {ERR_FATAL, "Transfer %d: xio allocDeviceMemory(signal) failed on GPU %d",
+              rss.transferIdx, effExeIndex};
+
+    ERR_CHECK(hipMemset(rss.xioSignal, 0, sizeof(uint64_t)));
     return ERR_NONE;
   }
 
-  // TODO(sdma-xio): Release rocm-xio handles (destroyQueue, free signal counter). Endpoint
-  // shutdown is deferred to process exit per sdma-ep.h idempotence guidance.
   static ErrResult TeardownSdmaXioTransferResources(TransferResources& rss,
-                                                    Transfer    const& t)
+                                                    Transfer    const& /*t*/)
+  {
+    if (rss.xioSignal) {
+      xio::freeDeviceMemory(rss.xioSignal, XIO_DEVICE_MEM_UNCACHED);
+      rss.xioSignal = nullptr;
+    }
+    xio::sdma_ep::destroyQueue(&rss.xioQueueInfo);
+    // shutdownEndpoint deferred to process exit (sdma-ep.h L879-898).
+    return ERR_NONE;
+  }
+#else  // !ROCM_XIO_AVAILABLE -- librocm-xio.so not found at build time or NVCC build
+  [[maybe_unused]] static ErrResult PrepareSdmaXioTransferResources(
+      ConfigOptions    const& /*cfg*/,
+      ExeDevice        const& /*exeDevice*/,
+      Transfer         const& /*t*/,
+      TransferResources&      /*rss*/)
+  {
+    return {ERR_FATAL, "SDMA-XIO executor not available (rocm-xio not found at build time)"};
+  }
+
+  [[maybe_unused]] static ErrResult TeardownSdmaXioTransferResources(
+      TransferResources& /*rss*/,
+      Transfer    const& /*t*/)
   {
     return ERR_NONE;
   }
+#endif
 
 // Data validation-related functions
 //========================================================================================
@@ -4375,14 +4600,15 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
     }
 
     // Prepare additional requirements for GPU-based executors
-    if ((exeDevice.exeType == EXE_GPU_GFX || exeDevice.exeType == EXE_GPU_DMA || exeDevice.exeType == EXE_GPU_BDMA
-         || exeDevice.exeType == EXE_GPU_SDMA_XIO)
+    // Note: EXE_GPU_SDMA_XIO is handled separately below because its streams must
+    // be created on the rerouted source GPU (effExeIndex), which can differ per
+    // transfer in the same ExeInfo.
+    if ((exeDevice.exeType == EXE_GPU_GFX || exeDevice.exeType == EXE_GPU_DMA || exeDevice.exeType == EXE_GPU_BDMA)
         && exeDevice.exeRank == localRank) {
       ERR_CHECK(hipSetDevice(exeDevice.exeIndex));
 
       // Determine how many streams to use
       int const numStreamsToUse = (exeDevice.exeType == EXE_GPU_DMA || exeDevice.exeType == EXE_GPU_BDMA ||
-                                   exeDevice.exeType == EXE_GPU_SDMA_XIO ||
                                   (exeDevice.exeType == EXE_GPU_GFX && cfg.gfx.useMultiStream))
                                   ? exeInfo.resources.size() : 1;
       exeInfo.streams.resize(numStreamsToUse);
@@ -4505,12 +4731,31 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
 #endif
     }
 
-    // Prepare for SDMA-XIO executor
-    if (IsSdmaXioExeType(exeDevice.exeType) && exeDevice.exeRank == localRank) {
-      for (auto& rss : exeInfo.resources) {
+    // Prepare for SDMA-XIO executor: per-transfer device placement.
+    // Unlike GFX/DMA/BDMA which share a single hipSetDevice(exeIndex) for all
+    // streams, SDMA-XIO reroutes each transfer to the GPU holding its source
+    // memory. Stream + queue + signal all live on the inline-computed
+    // effExeIndex. After PrepareSdmaXioTransferResources returns, the same
+    // device is also recorded in rss.xioQueueInfo.srcDeviceId for execute time.
+    // No HIP events: per-transfer timing comes from in-kernel wall_clock64()
+    // (see SdmaXioKernel below).
+    if (exeDevice.exeType == EXE_GPU_SDMA_XIO && exeDevice.exeRank == localRank) {
+#if defined(ROCM_XIO_AVAILABLE)
+      size_t const N = exeInfo.resources.size();
+      exeInfo.streams.resize(N);
+      for (size_t i = 0; i < N; ++i) {
+        auto& rss = exeInfo.resources[i];
         Transfer const& t = transfers[rss.transferIdx];
+        int const effExeIndex = SdmaXioEffExeIndex(t);
+
+        ERR_CHECK(hipSetDevice(effExeIndex));
+        ERR_CHECK(hipStreamCreate(&exeInfo.streams[i]));
+
         ERR_CHECK(PrepareSdmaXioTransferResources(cfg, exeDevice, t, rss));
       }
+#else
+      return {ERR_FATAL, "SDMA-XIO executor not available (rocm-xio not found at build time)"};
+#endif
     }
 
     // Check that GPU wallclock rate is non-zero
@@ -5757,15 +6002,111 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
 // SDMA-XIO Executor run-related functions
 //========================================================================================
 
-  // TODO(sdma-xio): Launch a single-thread kernel per Transfer that calls
-  // xio::sdma_ep::putSignal + waitSignal, then hipStreamSynchronize. Mirrors
-  // RunDmaExecutor's std::async-per-stream layout once parity work begins.
+#if defined(ROCM_XIO_AVAILABLE)
+  // Single-thread kernel: drives one xio putSignal/waitSignal pair per sub-iteration.
+  // Brackets the whole sub-iteration loop with wall_clock64() for per-transfer timing
+  // (mirrors GpuReduceKernel at TransferBench.hpp L4974/L5120-L5125). cyclesSlot is a
+  // pinned-host SdmaXioCycles* owned by RunSdmaXioExecutor for the duration of one call.
+  __global__ void SdmaXioKernel(xio::sdma_ep::SdmaQueueHandle* handle,
+                                void* dst, void* src, size_t nbytes,
+                                uint64_t* signal, int numSubIterations,
+                                SdmaXioCycles* cyclesSlot)
+  {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+
+    int64_t const startCycle = wall_clock64();
+    for (int i = 0; i < numSubIterations; ++i) {
+      xio::sdma_ep::putSignal(*handle, dst, src, nbytes, signal);
+      xio::sdma_ep::waitSignal(signal, (uint64_t)(i + 1));
+    }
+    int64_t const stopCycle = wall_clock64();
+
+    cyclesSlot->startCycle = startCycle;
+    cyclesSlot->stopCycle  = stopCycle;
+  }
+
+  // Execute a single SDMA-XIO transfer. Per-transfer timing comes from the
+  // in-kernel cycles written into cyclesSlot; the executor-level CPU clock is
+  // accumulated by RunSdmaXioExecutor (see below). Defensive hipSetDevice
+  // because std::async workers may not inherit the prepare-time device.
+  static ErrResult ExecuteSdmaXioTransfer(int            const  iteration,
+                                          hipStream_t    const  stream,
+                                          ConfigOptions  const& cfg,
+                                          TransferResources&    rss,
+                                          SdmaXioCycles*        cyclesSlot)
+  {
+    ERR_CHECK(hipSetDevice(rss.xioQueueInfo.srcDeviceId));
+
+    auto* gpuHandle = static_cast<xio::sdma_ep::SdmaQueueHandle*>(rss.xioQueueInfo.deviceHandle);
+    ERR_CHECK(hipMemsetAsync(rss.xioSignal, 0, sizeof(uint64_t), stream));
+
+    SdmaXioKernel<<<1, 1, 0, stream>>>(gpuHandle, rss.dstMem[0], rss.srcMem[0],
+                                       rss.numBytes, rss.xioSignal,
+                                       cfg.general.numSubIterations, cyclesSlot);
+    ERR_CHECK(hipGetLastError());
+    ERR_CHECK(hipStreamSynchronize(stream));
+
+    if (iteration >= 0) {
+      int wallClockRate = 0;
+      ERR_CHECK(hipDeviceGetAttribute(&wallClockRate, hipDeviceAttributeWallClockRate,
+                                      rss.xioQueueInfo.srcDeviceId));
+      double const deltaMsec =
+          (cyclesSlot->stopCycle - cyclesSlot->startCycle) / (double)wallClockRate
+          / cfg.general.numSubIterations;
+      rss.totalDurationMsec += deltaMsec;
+      if (cfg.general.recordPerIteration) rss.perIterMsec.push_back(deltaMsec);
+    }
+    return ERR_NONE;
+  }
+#endif
+
+  // Drive all SDMA-XIO transfers in one executor. Allocates a transient pinned-host
+  // cycle buffer of N slots outside the cpuStart/cpuDelta window so the alloc/free
+  // latency does not pollute exeInfo.totalDurationMsec. Per-transfer durations come
+  // from the in-kernel cycles via ExecuteSdmaXioTransfer; executor-level duration
+  // is CPU-clock-based, mirroring RunDmaExecutor.
   static ErrResult RunSdmaXioExecutor(int           const  iteration,
                                       ConfigOptions const& cfg,
-                                      int           const  exeIndex,
+                                      int           const  /*exeIndex*/,
                                       ExeInfo&             exeInfo)
   {
+#if !defined(ROCM_XIO_AVAILABLE)
+    return {ERR_FATAL, "SDMA-XIO executor not available (rocm-xio not found at build time)"};
+#else
+    size_t const N = exeInfo.resources.size();
+
+    SdmaXioCycles* cycleBuf = nullptr;
+    ERR_CHECK(hipHostMalloc((void**)&cycleBuf, N * sizeof(SdmaXioCycles),
+                            hipHostMallocDefault));
+
+    auto cpuStart = std::chrono::high_resolution_clock::now();
+
+    vector<std::future<ErrResult>> asyncTransfers;
+    for (size_t i = 0; i < N; ++i) {
+      asyncTransfers.emplace_back(std::async(std::launch::async,
+          ExecuteSdmaXioTransfer,
+          iteration,
+          exeInfo.streams[i],
+          std::cref(cfg),
+          std::ref(exeInfo.resources[i]),
+          &cycleBuf[i]));
+    }
+    ErrResult firstError = ERR_NONE;
+    for (auto& at : asyncTransfers) {
+      ErrResult r = at.get();
+      if (r.errType != ERR_NONE && firstError.errType == ERR_NONE) firstError = r;
+    }
+
+    auto cpuDelta = std::chrono::high_resolution_clock::now() - cpuStart;
+    double const deltaMsec =
+        std::chrono::duration_cast<std::chrono::duration<double>>(cpuDelta).count() * 1000.0
+        / cfg.general.numSubIterations;
+    if (iteration >= 0) exeInfo.totalDurationMsec += deltaMsec;
+
+    ERR_CHECK(hipHostFree(cycleBuf));
+    if (firstError.errType != ERR_NONE) return firstError;
     return ERR_NONE;
+#endif
   }
 
 // Executor-related functions

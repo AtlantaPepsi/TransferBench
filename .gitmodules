@@ -1,0 +1,3 @@
+[submodule "rocm-xio"]
+	path = rocm-xio
+	url = https://github.com/ROCm/rocm-xio.git

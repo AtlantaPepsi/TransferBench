@@ -71,6 +71,12 @@ int HelpPreset([[maybe_unused]] EnvVars&          ev,
   printf("#                 - B:    Batched-DMA-executor  (Indexed from 0 to # GPUs - 1)\n");
   printf("#                 - I#.#: NIC executor          (Indexed from 0 to # NICs - 1)\n");
   printf("#                 - N#.#: Nearest NIC executor  (Indexed from 0 to # GPUs - 1)\n");
+  printf("#                 - X:    SDMA-XIO executor     (Indexed from 0 to # GPUs - 1)\n");
+  printf("#                          Requires the binary to have been built with rocm-xio available\n");
+  printf("#                          (-DROCM_XIO_AVAILABLE auto-set when librocm-xio.so is found at build time).\n");
+  printf("#                          librocm-xio.so must remain available to the dynamic linker at runtime.\n");
+  printf("#                          Run-time needs HSA_ENABLE_SDMA=1 and /dev/kfd access (typical\n");
+  printf("#                          render/video group; root not required).\n");
   printf("#   dstMemL   :   Destination memory locations (Where the data is to be written to)\n");
   printf("#   bytesL    :   Number of bytes to copy (0 means use command-line specified size)\n");
   printf("#                 Must be a multiple of 4 and may be suffixed with ('K','M', or 'G')\n");

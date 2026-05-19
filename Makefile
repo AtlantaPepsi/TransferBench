@@ -72,6 +72,41 @@ ifeq ($(filter clean,$(MAKECMDGOALS)),)
     ifneq ($(strip $(ROCM_DEVICE_LIB_PATH)),)
       HIPFLAGS += --rocm-device-lib-path=$(ROCM_DEVICE_LIB_PATH)
     endif
+
+    # SDMA-XIO executor (X:) links dynamically against librocm-xio.so. Auto-
+    # detect: when present, define ROCM_XIO_AVAILABLE and add -lrocm-xio +
+    # rpath. When absent, the executor compiles out and reports a clear
+    # build-time-disabled error if anyone tries to invoke X: at runtime.
+    # Override with DISABLE_ROCM_XIO=1 to skip the link even if found.
+    #
+    # Default search order:
+    #   1. ./rocm-xio        (in-tree git submodule; portable across nodes)
+    #   2. ./../rocm-xio     (legacy parallel checkout for local dev)
+    # Override either by setting ROCM_XIO_PATH=/absolute/path on the make
+    # command line.
+    ROCM_XIO_SUBMODULE_PATH := $(abspath ./rocm-xio)
+    ROCM_XIO_FALLBACK_PATH  := $(abspath ./../rocm-xio)
+    ifeq ($(origin ROCM_XIO_PATH),undefined)
+      ifneq ($(wildcard $(ROCM_XIO_SUBMODULE_PATH)/build/librocm-xio.so),)
+        ROCM_XIO_PATH := $(ROCM_XIO_SUBMODULE_PATH)
+      else ifneq ($(wildcard $(ROCM_XIO_FALLBACK_PATH)/build/librocm-xio.so),)
+        ROCM_XIO_PATH := $(ROCM_XIO_FALLBACK_PATH)
+      else
+        ROCM_XIO_PATH := $(ROCM_XIO_SUBMODULE_PATH)
+      endif
+    endif
+    DISABLE_ROCM_XIO ?= 0
+    ifneq ($(DISABLE_ROCM_XIO),1)
+      ifneq ($(wildcard $(ROCM_XIO_PATH)/build/librocm-xio.so),)
+        COMMON_FLAGS += -DROCM_XIO_AVAILABLE
+        HIPLDFLAGS   += -L$(ROCM_XIO_PATH)/build -lrocm-xio -Wl,-rpath,$(ROCM_XIO_PATH)/build
+        $(info - Building with SDMA-XIO executor (rocm-xio at $(ROCM_XIO_PATH)))
+      else
+        $(info - Building without SDMA-XIO executor (librocm-xio.so not found at $(ROCM_XIO_PATH)/build; set ROCM_XIO_PATH or build rocm-xio first))
+      endif
+    else
+      $(info - SDMA-XIO executor disabled via DISABLE_ROCM_XIO=1)
+    endif
   endif
 
   ifeq ($(SINGLE_KERNEL), 1)
