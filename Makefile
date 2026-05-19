@@ -73,10 +73,13 @@ ifeq ($(filter clean,$(MAKECMDGOALS)),)
       HIPFLAGS += --rocm-device-lib-path=$(ROCM_DEVICE_LIB_PATH)
     endif
 
-    # SDMA-XIO executor (X:) links dynamically against librocm-xio.so. Auto-
-    # detect: when present, define ROCM_XIO_AVAILABLE and add -lrocm-xio +
-    # rpath. When absent, the executor compiles out and reports a clear
-    # build-time-disabled error if anyone tries to invoke X: at runtime.
+    # SDMA-XIO executor (X:) links against librocm-xio. We prefer the static
+    # archive (librocm-xio.a, rocm-xio's default build product) since it
+    # keeps the sdma-ep host symbols visible without requiring any patch to
+    # rocm-xio; the shared object path is kept as a fallback for sites that
+    # explicitly build with BUILD_SHARED_LIBS=ON. When neither is found the
+    # executor compiles out and reports a clear build-time-disabled error
+    # if anyone tries to invoke X: at runtime.
     # Override with DISABLE_ROCM_XIO=1 to skip the link even if found.
     #
     # Default search order:
@@ -87,9 +90,9 @@ ifeq ($(filter clean,$(MAKECMDGOALS)),)
     ROCM_XIO_SUBMODULE_PATH := $(abspath ./rocm-xio)
     ROCM_XIO_FALLBACK_PATH  := $(abspath ./../rocm-xio)
     ifeq ($(origin ROCM_XIO_PATH),undefined)
-      ifneq ($(wildcard $(ROCM_XIO_SUBMODULE_PATH)/build/librocm-xio.so),)
+      ifneq ($(wildcard $(ROCM_XIO_SUBMODULE_PATH)/build/librocm-xio.a $(ROCM_XIO_SUBMODULE_PATH)/build/librocm-xio.so),)
         ROCM_XIO_PATH := $(ROCM_XIO_SUBMODULE_PATH)
-      else ifneq ($(wildcard $(ROCM_XIO_FALLBACK_PATH)/build/librocm-xio.so),)
+      else ifneq ($(wildcard $(ROCM_XIO_FALLBACK_PATH)/build/librocm-xio.a $(ROCM_XIO_FALLBACK_PATH)/build/librocm-xio.so),)
         ROCM_XIO_PATH := $(ROCM_XIO_FALLBACK_PATH)
       else
         ROCM_XIO_PATH := $(ROCM_XIO_SUBMODULE_PATH)
@@ -97,12 +100,33 @@ ifeq ($(filter clean,$(MAKECMDGOALS)),)
     endif
     DISABLE_ROCM_XIO ?= 0
     ifneq ($(DISABLE_ROCM_XIO),1)
-      ifneq ($(wildcard $(ROCM_XIO_PATH)/build/librocm-xio.so),)
+      ifneq ($(wildcard $(ROCM_XIO_PATH)/build/librocm-xio.a),)
+        # Static archive: force-static via -Bstatic/-Bdynamic bracket so the
+        # linker grabs the .a even if a .so is also present. We route it
+        # through -Wl,... rather than passing the .a path as a positional
+        # argument because the compile-and-link step uses -x hip, which
+        # would otherwise treat the .a as a HIP source file. Also pull in
+        # rocm-xio's transitive deps that the .so would have carried:
+        #   - hsakmt    : KFD ioctl wrapper (static-only on ROCm 6/7)
+        #   - drm_amdgpu, drm : pulled in by hsakmt's topology.c at static
+        #                       link time (system libdrm)
+        #   - dl        : rocm-xio's ibv-wrapper dlopen of vendor RDMA libs
+        #
+        # rocm-xio's .hip TUs are compiled with -fgpu-rdc, so the device-link
+        # pass that produces __hip_fatbin_* / __hip_gpubin_handle_* symbols
+        # is deferred to the final consumer. We therefore add -fgpu-rdc to
+        # both compile and link so amdclang++ runs the device linker on
+        # TransferBench + rocm-xio's archive together.
+        COMMON_FLAGS += -DROCM_XIO_AVAILABLE
+        HIPFLAGS     += -fgpu-rdc
+        HIPLDFLAGS   += -fgpu-rdc -L$(ROCM_XIO_PATH)/build -Wl,-Bstatic -lrocm-xio -Wl,-Bdynamic -lhsakmt -ldrm_amdgpu -ldrm -ldl
+        $(info - Building with SDMA-XIO executor (static, rocm-xio at $(ROCM_XIO_PATH)))
+      else ifneq ($(wildcard $(ROCM_XIO_PATH)/build/librocm-xio.so),)
         COMMON_FLAGS += -DROCM_XIO_AVAILABLE
         HIPLDFLAGS   += -L$(ROCM_XIO_PATH)/build -lrocm-xio -Wl,-rpath,$(ROCM_XIO_PATH)/build
-        $(info - Building with SDMA-XIO executor (rocm-xio at $(ROCM_XIO_PATH)))
+        $(info - Building with SDMA-XIO executor (shared, rocm-xio at $(ROCM_XIO_PATH)))
       else
-        $(info - Building without SDMA-XIO executor (librocm-xio.so not found at $(ROCM_XIO_PATH)/build; set ROCM_XIO_PATH or build rocm-xio first))
+        $(info - Building without SDMA-XIO executor (librocm-xio.{a,so} not found at $(ROCM_XIO_PATH)/build; set ROCM_XIO_PATH or build rocm-xio first))
       endif
     else
       $(info - SDMA-XIO executor disabled via DISABLE_ROCM_XIO=1)
